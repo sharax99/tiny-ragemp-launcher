@@ -132,4 +132,199 @@ Placeholder image as the loading background (`IMG 006` = that slot) + recolored 
 | ✅ | Updater offline bypass — 6 patches, CDN check skipped |
 | ✅ | RUI UI editor — config-driven, byte-exact repack |
 | ✅ | Domain whitelist bypass — hosts file or rui auto-connect by IP |
+| ✅ |	Custom application icon
+| ✅ |	Multi-language support (English, Turkish, Russian)
+| ✅ |	Automatic RUI updater
+| ✅ |	Custom update infrastructure support
+
+# tiny-ragemp-launcher (Türkçe)
+
+> ⚠️ **Uyarı**
+>
+> Bu proje yalnızca kapanma sürecindeki bir launcher'ı çalışır durumda tutmak amacıyla oluşturulmuştur. Herhangi bir **ticari amacı veya gelir modeli bulunmamaktadır**. Rockstar Games (Take-Two Interactive) ve RAGE:MP'nin haklarına saygı duyuyorum. Resmî bir itiraz gelmesi halinde proje tamamen kaldırılacaktır. Burada yapılan çalışmalar **abandonware koruma (preservation)** kapsamında değerlendirilmektedir.
+
+![launcher](launcher.png)
+
+`RAGEMP\updater.exe` için hazırlanmış küçük bir ImGui arayüzüdür. IP ve port girilip "Connect" butonuna basıldığında launcher, `HKCU\Software\RAGE-MP\launch2.{ip,port}` kayıtlarını oluşturur ve çalışma dizini RAGEMP klasörü olacak şekilde updater'ı başlatır. Updater kayıt defterindeki bilgileri okur, sunucu tarayıcısını atlar ve oyunu doğrudan başlatır. (Tersine mühendislik yaptığım büyük Rus launcher'larının tamamı da aynı yöntemi kullanmaktadır.)
+
+## Derleme
+
+Visual Studio 2022 ve C++ iş yükü gereklidir.
+
+```bash
+build.bat
+```
+
+Çıktı:
+
+```text
+build\tiny-ragemp-launcher.exe
+```
+
+İlk çalıştırmada ImGui v1.91.5, CMake FetchContent üzerinden otomatik olarak indirilir.
+
+Yaklaşık 570 KB boyutunda tek bir çalıştırılabilir dosya üretir ve ek DLL gerektirmez.
+
+Program kendi dizininde bir `RAGEMP\` klasörü arar. RAGE:MP dosyalarının bir kopyasını çalıştırılabilir dosyanın yanına yerleştirin.
+
+## RAGE:MP'nin Kapanış Süreci Hakkında
+
+Yaklaşık 2-3 gün önce RAGE:MP ekibi platformu kapatacaklarını duyurdu. Gerekçe olarak Rockstar Games / Take-Two Interactive Platform Lisans Sözleşmesi gösterildi. Bu sözleşmeye göre FiveM, GTAV için yetkilendirilmiş tek çok oyunculu modlama platformu olarak kabul ediliyor.
+
+Genel sunucu listesi 1 Haziran 2026 tarihinde kapatılacak, resmi destek ise 31 Ağustos 2026 tarihinde sona erecek.
+
+Resmî açıklama:
+https://rage.mp/forums/topic/26561-long-term-eco-system-integration-pt-ii-final-outreach-cd/
+
+Topluluğun söz hakkı bulunmadığı bir lisans anlaşmazlığı nedeniyle yıllardır oluşmuş bir ekosistemin sona erdirilmesi oldukça üzücü bir durum. Sayısız roleplay kod tabanı, sunucu altyapısı ve üçüncü taraf araçların API uyumluluğu dahi bulunmayan başka bir platforma taşınması bekleniyor.
+
+Buna rağmen istemci ve sunucu dosyaları hâlâ kullanıcıların bilgisayarlarında bulunuyor ve bu launcher, protokolün hâlâ çalıştığını gösteriyor. Çalışan herhangi bir RAGE:MP sunucusuna IP girin, kayıt defterini yazın, updater'ı başlatın ve oyuna bağlanın.
+
+Ancak önemli bir detay var:
+
+RAGE:MP yalnızca bir sunucu listesi değildir. Her başlatma işlemi sırasında Rage API (`cdn.rgsvc.io`), Rockstar Games servisleri ve Easy Anti-Cheat ile iletişim kurulur. Bu servislerden herhangi biri erişilemez hâle gelirse, bu kategorideki tüm launcher'lar gibi bu proje de çalışmayı durduracaktır.
+
+## Offline Updater Bypass Yaması
+
+Resmî `updater.exe`, `ragemp_v.exe` dosyasını başlatmadan önce `cdn.rgsvc.io` bağlantısını zorunlu olarak kontrol eder.
+
+İnternet bağlantısı olmadığında veya CDN erişilemez olduğunda updater başarısız olur.
+
+Aşağıdaki 6 ikili (binary) yama CDN kontrolünü tamamen devre dışı bırakır:
+
+| # | Offset | Orijinal            | Yamalı              | Açıklama                        |
+| - | ------ | ------------------- | ------------------- | ------------------------------- |
+| 1 | 0x9393 | `A0 0F 00 00`       | `32 00 00 00`       | Zaman aşımı 4000ms → 50ms       |
+| 2 | 0x9603 | `0F 8D BD 02 00 00` | `E9 BE 02 00 00 90` | Manifest tekrar döngüsünü atlar |
+| 3 | 0x98CB | `0F 85 84 4B 00 00` | `90 90 90 90 90 90` | Bağlantı hatasını atlar         |
+| 4 | 0x98D9 | `0F 85 76 4B 00 00` | `90 90 90 90 90 90` | Bağlantı hatasını atlar         |
+| 5 | 0xA04D | `0F 8E DE 0A 00 00` | `E9 DE 0A 00 00 90` | Dosya indirmelerini atlar       |
+| 6 | 0x99AA | `0F 84 96 04 00 00` | `E9 82 11 00 00 90` | Manifest ayrıştırmasını atlar   |
+
+Yamalar herhangi bir hex editör veya script ile uygulanabilir.
+
+Yamalı updater doğru `upd` token'ını üretir, `ShellExecuteExW("ragemp_v.exe")` çağrısını yapar ve istemci çevrimdışı olarak başlatılabilir.
+
+## Domain Whitelist (Çözüldü)
+
+`ragemp_v.exe`, `launch2.ip` kayıt defteri değerleri için gömülü bir alan adı beyaz listesi kullanmaktadır.
+
+Yalnızca:
+
+* `*.gta5rp.com`
+* `*.grandrp.com`
+
+alt alan adlarına izin verilir.
+
+Özel alan adları (`play.xxxx.com` gibi) sessizce reddedilir. Bu durumda kayıt defteri temizlenir ve doğrudan bağlanmak yerine sunucu tarayıcısı açılır.
+
+Bunu aşmanın iki yolu vardır:
+
+### 1. Hosts Dosyası
+
+Sunucu IP'nizi izin verilen bir alan adına yönlendirin:
+
+```text
+# C:\Windows\System32\drivers\etc\hosts
+
+YOUR.SERVER.IP myserver.gta5rp.com
+```
+
+Daha sonra:
+
+```text
+launch2.ip = myserver.gta5rp.com
+```
+
+olarak ayarlayın.
+
+Whitelist kontrolü geçilir, DNS çözümlemesi hosts dosyası üzerinden yapılır ve istemci sunucunuza bağlanır.
+
+Bu işlem launcher tarafından otomatikleştirilebilir.
+
+### 2. RUI Editor Auto-Connect
+
+`tools/config.json` içerisinde:
+
+```json
+"auto_connect": "IP:PORT"
+```
+
+kullanılabilir.
+
+Arayüz doğrudan:
+
+```js
+launchGame(ip, port)
+```
+
+çağrısı yapar.
+
+Whitelist yalnızca alan adlarını filtrelediği için ham IP adresleri bu kontrole takılmaz.
+
+## RUI Arayüz Editörü (tools/)
+
+`updater.exe`, launcher arayüzünü:
+
+```text
+RAGEMP\cef\
+RAGEMP\rui\index.rui
+```
+
+üzerinden oluşturur.
+
+Bu yapı, webpack ile derlenmiş bir Vue SPA uygulamasının özel bir arşiv formatına paketlenmiş hâlidir.
+
+`tools/` klasörü yapılandırma tabanlı bir editör içerir ve dosyaları birebir aynı biçimde yeniden paketleyebilir.
+
+Tamamen Python ile yazılmıştır ve harici bağımlılık gerektirmez.
+
+```bash
+cd tools
+python build.py
+```
+
+`config.json` içerisindeki:
+
+```json
+base_rui
+out_rui
+```
+
+alanlarını kendi dosyalarınıza göre ayarlayın.
+
+### Desteklenen Özelleştirmeler
+
+| Ayar          | Açıklama                                |
+| ------------- | --------------------------------------- |
+| auto_connect  | Arayüz açıldığında otomatik bağlan      |
+| server_list   | Görüntülenen sunucu listesini değiştir  |
+| colors        | Tema renklerini değiştir                |
+| texts / title | Metinleri ve pencere başlığını değiştir |
+| images        | Arayüz görsellerini değiştir            |
+
+Sunucu listesi özelleştirmesi yalnızca görüntülenen listeyi değiştirir. Bağlantı işlemi yine standart `rageApi.launchGame` yolu üzerinden gerçekleşir.
+
+## Son Güncellemeler
+
+* ✅ Özel uygulama ikonu eklendi.
+* ✅ Türkçe, İngilizce ve Rusça dil desteği eklendi.
+* ✅ Otomatik RUI güncelleyicisi eklendi.
+* ✅ Sunucu sahipleri için özelleştirilebilir güncelleme sistemi eklendi.
+* ✅ `main.cpp` üzerinden güncelleme adresleri ve indirme bağlantıları değiştirilebilir.
+* ✅ CDN ve RUI dosyaları topluluğun kendi sunucularından dağıtılabilir.
+
+## Yol Haritası
+
+| Durum | Görev                                          |
+| ----- | ---------------------------------------------- |
+| ✅     | Launcher — registry yazımı ve updater başlatma |
+| ✅     | Offline updater bypass — CDN kontrolü atlandı  |
+| ✅     | RUI arayüz editörü                             |
+| ✅     | Domain whitelist bypass                        |
+| ✅     | Çoklu dil desteği                              |
+| ✅     | Otomatik RUI güncelleyicisi                    |
+| ✅     | Özel ikon desteği                              |
+| ✅     | Özelleştirilebilir güncelleme altyapısı        |
+
 
