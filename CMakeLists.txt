@@ -12,7 +12,13 @@ FetchContent_Declare(
     GIT_TAG        v1.91.5
     GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(imgui)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui nlohmann_json)
 
 set(IMGUI_SRC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -42,6 +48,8 @@ target_link_libraries(tiny-ragemp-launcher PRIVATE
     shell32
     user32
     urlmon
+    bcrypt
+    nlohmann_json::nlohmann_json
 )
 
 target_compile_definitions(tiny-ragemp-launcher PRIVATE

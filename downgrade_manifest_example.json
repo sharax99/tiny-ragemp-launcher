@@ -1,0 +1,93 @@
+{
+  "_comment": "Bu dosyayi GitHub Gist'e yukleyin ve DOWNGRADE_MANIFEST_URL'yi guncelleyin.",
+  "_instructions": [
+    "1. Rockstar guncelleme yayinladiginda, yeni GTA5.exe ve update.rpf dosyalarinin SHA-256 hashlerini alin",
+    "2. Downgrade edilmis (eski surum) dosyalarin hashlerini alin",
+    "3. Downgrade dosyalarini CDN'e (Dropbox/Google Drive) yukleyin",
+    "4. Bu manifest'i guncelleyin ve Gist'e push edin"
+  ],
+  
+  "target_game_version": "1.0.3788.0",
+  "compatible_ragemp_version": "1.1.1",
+  
+  "platforms": {
+    "steam": {
+      "files": [
+        {
+          "path": "GTA5.exe",
+          "sha256_current": "YENI_GTA5EXE_HASH",
+          "sha256_downgraded": "ESKI_GTA5EXE_HASH",
+          "download_url": "https://CDN/steam/GTA5.exe"
+        },
+        {
+          "path": "update\\update.rpf",
+          "sha256_current": "YENI_UPDATE_RPF_HASH",
+          "sha256_downgraded": "ESKI_UPDATE_RPF_HASH",
+          "download_url": "https://CDN/common/update.rpf"
+        },
+        {
+          "path": "update\\update2.rpf",
+          "sha256_current": "YENI_UPDATE2_RPF_HASH",
+          "sha256_downgraded": "ESKI_UPDATE2_RPF_HASH",
+          "download_url": "https://CDN/common/update2.rpf"
+        }
+      ]
+    },
+    "epic": {
+      "files": [
+        {
+          "path": "GTA5.exe",
+          "sha256_current": "YENI_GTA5EXE_HASH",
+          "sha256_downgraded": "5CB8A19A4D0F5431DB9EC4AC6F6ACABCC9DC8B1A78263B02845886853ED1E39C",
+          "download_url": "https://CDN/epic/GTA5.exe"
+        },
+        {
+          "path": "PlayGTAV.exe",
+          "sha256_current": "YENI_PLAYGTAV_HASH",
+          "sha256_downgraded": "1F78DBAB6AB8D756EA394DF5FD387F0E9540D55A59A674DE45EFADD1D7EFEEB0",
+          "download_url": "https://CDN/epic/PlayGTAV.exe"
+        },
+        {
+          "path": "update\\update.rpf",
+          "sha256_current": "YENI_UPDATE_RPF_HASH",
+          "sha256_downgraded": "089F0824689BF9FEA508EEDCCAFA67D07FD6B48644514D3B3E9359AE8D06A40F",
+          "download_url": "https://CDN/common/update.rpf"
+        },
+        {
+          "path": "update\\update2.rpf",
+          "sha256_current": "YENI_UPDATE2_RPF_HASH",
+          "sha256_downgraded": "04B4BB4529FAAC418BC2D30D80DAC40A8063E746831CDD3F1FCBA7CC3FDD0868",
+          "download_url": "https://CDN/common/update2.rpf"
+        }
+      ]
+    },
+    "rockstar": {
+      "files": [
+        {
+          "path": "GTA5.exe",
+          "sha256_current": "YENI_GTA5EXE_HASH",
+          "sha256_downgraded": "ESKI_GTA5EXE_HASH",
+          "download_url": "https://CDN/rockstar/GTA5.exe"
+        },
+        {
+          "path": "GTAVLauncher.exe",
+          "sha256_current": "YENI_LAUNCHER_HASH",
+          "sha256_downgraded": "ESKI_LAUNCHER_HASH",
+          "download_url": "https://CDN/rockstar/GTAVLauncher.exe"
+        },
+        {
+          "path": "update\\update.rpf",
+          "sha256_current": "YENI_UPDATE_RPF_HASH",
+          "sha256_downgraded": "ESKI_UPDATE_RPF_HASH",
+          "download_url": "https://CDN/common/update.rpf"
+        },
+        {
+          "path": "update\\update2.rpf",
+          "sha256_current": "YENI_UPDATE2_RPF_HASH",
+          "sha256_downgraded": "ESKI_UPDATE2_RPF_HASH",
+          "download_url": "https://CDN/common/update2.rpf"
+        }
+      ]
+    }
+  }
+}

@@ -15,6 +15,9 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <algorithm>
+#include <bcrypt.h>
+#include <nlohmann/json.hpp>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -25,6 +28,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 static HWND                    g_hwnd               = nullptr;
 static ID3D11Device*           g_pd3dDevice         = nullptr;
@@ -36,11 +40,31 @@ static UINT                    g_resizeWidth        = 0;
 static UINT                    g_resizeHeight       = 0;
 
 constexpr int    WINDOW_W       = 420;
-constexpr int    WINDOW_H       = 380;
+constexpr int    WINDOW_H       = 520;
 constexpr int    TITLE_BAR_H    = 32;
 constexpr int    RESIZE_BORDER  = 0;   
 
 enum class Language { EN, TR, RU };
+enum class GamePlatform { UNKNOWN, STEAM, EPIC, ROCKSTAR };
+
+struct DowngradeFileInfo {
+    std::string relativePath;
+    std::string sha256Current;     // Updated file hash (Rockstar's new version)
+    std::string sha256Downgraded;  // Downgraded file hash (our target)
+    std::string downloadUrl;
+    uint64_t    sizeBytes = 0;
+};
+
+struct ProtectionStatus {
+    bool steamManifestLocked = false;
+    bool socialClubBlocked   = false;
+    bool epicManifestLocked  = false;
+    bool scOfflineMode       = false;
+    bool filesDowngraded     = false;
+    GamePlatform platform    = GamePlatform::UNKNOWN;
+    std::string gtaPath;
+    std::string platformName;
+};
 
 struct AppState {
     char        server[128] = "rage.sharax.com";
@@ -61,6 +85,19 @@ static const char* Tr(const char* en, const char* tr, const char* ru) {
 static std::atomic<bool> g_isDownloading{false};
 static std::mutex        g_downloadMutex;
 static std::string       g_downloadStatusMsg;
+
+// ==================== DOWNGRADE SYSTEM STATE ====================
+static std::atomic<bool>  g_isDowngrading{false};
+static std::mutex         g_downgradeMutex;
+static std::string        g_downgradeStatusMsg;
+static ProtectionStatus   g_protectionStatus;
+static float              g_downgradeProgress = 0.0f;
+
+// Downgrade manifest URL — update this Gist with your downgrade info
+static const wchar_t* DOWNGRADE_MANIFEST_URL = 
+    L"https://gist.githubusercontent.com/sharax99/REPLACE_WITH_REAL_GIST_ID/raw/downgrade_manifest.json";
+
+using json = nlohmann::json;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 static LRESULT WINAPI WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -123,6 +160,587 @@ static void WriteStringToFile(const std::wstring& path, const std::string& conte
     f << content;
 }
 
+// ==================== DOWNGRADE SYSTEM ====================
+
+// --- Utility: Wide <-> Narrow string conversion ---
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int sz = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring ws(sz, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), sz);
+    return ws;
+}
+
+static std::string WideToUtf8(const std::wstring& ws) {
+    if (ws.empty()) return "";
+    int sz = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(sz, 0);
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), s.data(), sz, nullptr, nullptr);
+    return s;
+}
+
+// --- SHA-256 via Windows BCrypt ---
+static std::string ComputeSHA256(const std::wstring& filePath) {
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    std::string result;
+
+    if (FAILED(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
+        { CloseHandle(hFile); return ""; }
+
+    DWORD hashObjSize = 0, dataSize = 0;
+    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&hashObjSize, sizeof(DWORD), &dataSize, 0);
+
+    std::vector<BYTE> hashObj(hashObjSize);
+    if (FAILED(BCryptCreateHash(hAlg, &hHash, hashObj.data(), hashObjSize, NULL, 0, 0)))
+        { BCryptCloseAlgorithmProvider(hAlg, 0); CloseHandle(hFile); return ""; }
+
+    BYTE buffer[65536];
+    DWORD bytesRead;
+    while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
+        BCryptHashData(hHash, buffer, bytesRead, 0);
+    }
+
+    BYTE hash[32];
+    BCryptFinishHash(hHash, hash, 32, 0);
+
+    char hex[65];
+    for (int i = 0; i < 32; i++) sprintf_s(hex + i * 2, 3, "%02x", hash[i]);
+    hex[64] = 0;
+    result = std::string(hex);
+
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    CloseHandle(hFile);
+    return result;
+}
+
+// --- GTA V Install Path Detection ---
+static std::wstring FindGTAPathFromRegistry() {
+    // Try Rockstar's registry key (works for all platforms)
+    const char* keys[] = {
+        "SOFTWARE\\WOW6432Node\\Rockstar Games\\Grand Theft Auto V",
+        "SOFTWARE\\Rockstar Games\\Grand Theft Auto V",
+        "SOFTWARE\\WOW6432Node\\Rockstar Games\\GTAV",
+    };
+    for (auto key : keys) {
+        HKEY hKey;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
+            char buf[MAX_PATH] = {0};
+            DWORD sz = sizeof(buf);
+            if (RegQueryValueExA(hKey, "InstallFolder", nullptr, nullptr, (LPBYTE)buf, &sz) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                std::string path(buf);
+                if (!path.empty() && GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    return Utf8ToWide(path);
+            }
+            RegCloseKey(hKey);
+        }
+    }
+    return L"";
+}
+
+static std::wstring FindGTAPath() {
+    // 1. Try registry
+    std::wstring regPath = FindGTAPathFromRegistry();
+    if (!regPath.empty()) return regPath;
+
+    // 2. Try config file next to launcher
+    std::wstring configPath = GetLauncherDir() + L"\\gta_path.txt";
+    std::string cfgContent = ReadFileToString(configPath);
+    cfgContent.erase(cfgContent.find_last_not_of(" \n\r\t") + 1);
+    if (!cfgContent.empty()) {
+        std::wstring p = Utf8ToWide(cfgContent);
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return p;
+    }
+
+    // 3. Common default paths
+    const wchar_t* defaults[] = {
+        L"C:\\Program Files\\Rockstar Games\\Grand Theft Auto V",
+        L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Grand Theft Auto V",
+        L"D:\\SteamLibrary\\steamapps\\common\\Grand Theft Auto V",
+        L"E:\\SteamLibrary\\steamapps\\common\\Grand Theft Auto V",
+        L"C:\\Program Files\\Epic Games\\GTAV",
+    };
+    for (auto dp : defaults) {
+        if (GetFileAttributesW(dp) != INVALID_FILE_ATTRIBUTES)
+            return dp;
+    }
+
+    return L"";
+}
+
+// --- Platform Detection ---
+static GamePlatform DetectGamePlatform(const std::wstring& gtaPath) {
+    // Steam: has steam_api64.dll
+    if (GetFileAttributesW((gtaPath + L"\\steam_api64.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return GamePlatform::STEAM;
+
+    // Epic: has EOSSDK-Win64-Shipping.dll or PlayGTAV.exe
+    if (GetFileAttributesW((gtaPath + L"\\EOSSDK-Win64-Shipping.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return GamePlatform::EPIC;
+
+    // Rockstar (fallback)
+    return GamePlatform::ROCKSTAR;
+}
+
+static const char* PlatformToString(GamePlatform p) {
+    switch (p) {
+        case GamePlatform::STEAM:     return "Steam";
+        case GamePlatform::EPIC:      return "Epic Games";
+        case GamePlatform::ROCKSTAR:  return "Rockstar";
+        default:                      return "Unknown";
+    }
+}
+
+// --- Steam App Manifest Protection ---
+static std::wstring FindSteamAppsPath() {
+    // Read Steam install path from registry
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return L"";
+
+    char buf[MAX_PATH] = {0};
+    DWORD sz = sizeof(buf);
+    if (RegQueryValueExA(hKey, "SteamPath", nullptr, nullptr, (LPBYTE)buf, &sz) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return L"";
+    }
+    RegCloseKey(hKey);
+
+    std::wstring steamPath = Utf8ToWide(std::string(buf));
+
+    // Check main steamapps folder
+    std::wstring mainApps = steamPath + L"\\steamapps";
+    if (GetFileAttributesW((mainApps + L"\\appmanifest_271590.acf").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return mainApps;
+
+    // Parse libraryfolders.vdf to find other libraries
+    std::string vdf = ReadFileToString(steamPath + L"\\config\\libraryfolders.vdf");
+    if (!vdf.empty()) {
+        // Simple parse: find "path" values
+        size_t pos = 0;
+        while ((pos = vdf.find("\"path\"", pos)) != std::string::npos) {
+            pos = vdf.find("\"", pos + 6);
+            if (pos == std::string::npos) break;
+            pos++;
+            size_t end = vdf.find("\"", pos);
+            if (end == std::string::npos) break;
+            std::string libPath = vdf.substr(pos, end - pos);
+            // Replace \\\\ with backslash
+            std::string cleaned;
+            for (size_t i = 0; i < libPath.size(); i++) {
+                if (libPath[i] == '\\' && i + 1 < libPath.size() && libPath[i + 1] == '\\')
+                    i++; // skip double backslash
+                cleaned += libPath[i];
+            }
+            std::wstring wLib = Utf8ToWide(cleaned) + L"\\steamapps";
+            if (GetFileAttributesW((wLib + L"\\appmanifest_271590.acf").c_str()) != INVALID_FILE_ATTRIBUTES)
+                return wLib;
+            pos = end + 1;
+        }
+    }
+
+    return L"";
+}
+
+static bool ProtectSteamManifest() {
+    std::wstring steamApps = FindSteamAppsPath();
+    if (steamApps.empty()) return false;
+
+    std::wstring manifestPath = steamApps + L"\\appmanifest_271590.acf";
+
+    // Remove read-only first so we can modify
+    SetFileAttributesW(manifestPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    std::string content = ReadFileToString(manifestPath);
+    if (content.empty()) return false;
+
+    // Replace StateFlags with "4" (FullyInstalled)
+    // Format: \t"StateFlags"\t\t"X"
+    auto replaceField = [&](const std::string& field, const std::string& newValue) {
+        size_t pos = content.find("\"" + field + "\"");
+        if (pos == std::string::npos) return;
+        // Find the value after the field
+        pos = content.find("\"", pos + field.size() + 2);
+        if (pos == std::string::npos) return;
+        pos++; // skip opening quote
+        size_t end = content.find("\"", pos);
+        if (end == std::string::npos) return;
+        content.replace(pos, end - pos, newValue);
+    };
+
+    replaceField("StateFlags", "4");
+    replaceField("AutoUpdateBehavior", "1");
+    replaceField("ScheduledAutoUpdate", "0");
+
+    WriteStringToFile(manifestPath, content);
+
+    // Lock as read-only — Steam can't modify it
+    SetFileAttributesW(manifestPath.c_str(), FILE_ATTRIBUTE_READONLY);
+
+    return true;
+}
+
+// --- Social Club Firewall Protection ---
+static bool RunElevatedCommand(const std::wstring& cmd) {
+    // Since launcher already runs as admin (requireAdministrator manifest),
+    // we can just use CreateProcessW directly
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+
+    std::wstring cmdCopy = cmd;
+    DWORD exitCode = 1;
+    if (CreateProcessW(nullptr, cmdCopy.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 10000); // 10s timeout
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    return exitCode == 0;
+}
+
+static bool IsFirewallRuleExists(const std::wstring& ruleName) {
+    std::wstring cmd = L"netsh advfirewall firewall show rule name=\"" + ruleName + L"\"";
+    return RunElevatedCommand(cmd);
+}
+
+static bool BlockGTAVLauncherFirewall(const std::wstring& gtaPath) {
+    std::wstring launcherExe = gtaPath + L"\\GTAVLauncher.exe";
+    if (GetFileAttributesW(launcherExe.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return false; // GTAVLauncher.exe doesn't exist
+
+    std::wstring ruleName = L"SharaxDowngradeProtection";
+
+    // Check if rule already exists
+    if (IsFirewallRuleExists(ruleName))
+        return true; // Already protected
+
+    // Add outbound block rule
+    std::wstring cmd = L"netsh advfirewall firewall add rule "
+        L"name=\"" + ruleName + L"\" "
+        L"dir=out "
+        L"action=block "
+        L"program=\"" + launcherExe + L"\" "
+        L"enable=yes "
+        L"profile=any";
+
+    return RunElevatedCommand(cmd);
+}
+
+// --- Social Club Offline Mode ---
+static bool SetSCOfflineMode() {
+    HKEY hKey;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, 
+                        "Software\\Rockstar Games\\Grand Theft Auto V",
+                        0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE, nullptr, &hKey, nullptr) != ERROR_SUCCESS)
+        return false;
+
+    const char* cmdLine = "-scOfflineOnly";
+    LONG r = RegSetValueExA(hKey, "CmdLine", 0, REG_SZ,
+                            reinterpret_cast<const BYTE*>(cmdLine),
+                            static_cast<DWORD>(strlen(cmdLine) + 1));
+    RegCloseKey(hKey);
+    return r == ERROR_SUCCESS;
+}
+
+// --- Epic Games Store Protection ---
+static bool ProtectEpicInstallation(const std::wstring& gtaPath) {
+    // Find Epic manifests directory
+    wchar_t programData[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"PROGRAMDATA", programData, MAX_PATH))
+        return false;
+
+    std::wstring manifestDir = std::wstring(programData) + 
+        L"\\Epic\\EpicGamesLauncher\\Data\\Manifests";
+
+    if (GetFileAttributesW(manifestDir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return false;
+
+    // Find GTA V manifest (.item file)
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW((manifestDir + L"\\*.item").c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+    do {
+        std::wstring itemPath = manifestDir + L"\\" + fd.cFileName;
+        std::string content = ReadFileToString(itemPath);
+        // Check if this manifest is for GTA V (AppID or install location)
+        if (content.find("Grand Theft Auto V") != std::string::npos ||
+            content.find("GTA5") != std::string::npos ||
+            content.find("271590") != std::string::npos) {
+            // Lock this manifest as read-only
+            SetFileAttributesW(itemPath.c_str(), FILE_ATTRIBUTE_READONLY);
+            found = true;
+            break;
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    return found;
+}
+
+// --- Apply All Protections ---
+static ProtectionStatus ApplyUpdateProtection(GamePlatform platform, 
+                                               const std::wstring& gtaPath) {
+    ProtectionStatus status;
+    status.platform = platform;
+    status.gtaPath = WideToUtf8(gtaPath);
+    status.platformName = PlatformToString(platform);
+
+    // Social Club protection — applies to ALL platforms
+    status.socialClubBlocked = BlockGTAVLauncherFirewall(gtaPath);
+    status.scOfflineMode = SetSCOfflineMode();
+
+    // Platform-specific protection
+    switch (platform) {
+        case GamePlatform::STEAM:
+            status.steamManifestLocked = ProtectSteamManifest();
+            break;
+        case GamePlatform::EPIC:
+            status.epicManifestLocked = ProtectEpicInstallation(gtaPath);
+            break;
+        case GamePlatform::ROCKSTAR:
+            // Social Club protection is sufficient
+            break;
+        default:
+            break;
+    }
+
+    return status;
+}
+
+// --- Downgrade Check & Download Thread ---
+static void SetDowngradeStatus(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_downgradeMutex);
+    g_downgradeStatusMsg = msg;
+}
+
+static bool DownloadFileTo(const std::wstring& url, const std::wstring& dest) {
+    // Use PowerShell for reliable HTTPS downloads with progress
+    std::wstring cmd = L"powershell -NoProfile -NonInteractive -Command \"";
+    cmd += L"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; ";
+    cmd += L"Invoke-WebRequest -UseBasicParsing -Uri '";
+    cmd += url;
+    cmd += L"' -OutFile '";
+    cmd += dest;
+    cmd += L"'\"";
+
+    return RunElevatedCommand(cmd);
+}
+
+static void DowngradeCheckThread() {
+    g_isDowngrading = true;
+    SetDowngradeStatus("Checking game version...");
+
+    // 1. Find GTA V path
+    std::wstring gtaPath = FindGTAPath();
+    if (gtaPath.empty()) {
+        SetDowngradeStatus("GTA V not found");
+        Sleep(3000);
+        SetDowngradeStatus("");
+        g_isDowngrading = false;
+        return;
+    }
+
+    // 2. Detect platform
+    GamePlatform platform = DetectGamePlatform(gtaPath);
+    {
+        std::lock_guard<std::mutex> lock(g_downgradeMutex);
+        g_protectionStatus.platform = platform;
+        g_protectionStatus.platformName = PlatformToString(platform);
+        g_protectionStatus.gtaPath = WideToUtf8(gtaPath);
+    }
+
+    SetDowngradeStatus("Downloading downgrade manifest...");
+
+    // 3. Download manifest
+    std::wstring base = GetLauncherDir();
+    std::wstring tempManifest = base + L"\\downgrade_manifest.json";
+
+    HRESULT hr = URLDownloadToFileW(nullptr, DOWNGRADE_MANIFEST_URL, 
+                                     tempManifest.c_str(), 0, nullptr);
+    if (FAILED(hr)) {
+        // Can't reach manifest server — check if already downgraded via local state
+        std::wstring stateFile = base + L"\\downgrade_state.json";
+        std::string stateContent = ReadFileToString(stateFile);
+        if (!stateContent.empty()) {
+            try {
+                json state = json::parse(stateContent);
+                std::lock_guard<std::mutex> lock(g_downgradeMutex);
+                g_protectionStatus.filesDowngraded = state.value("downgraded", false);
+            } catch (...) {}
+        }
+        SetDowngradeStatus("");
+        g_isDowngrading = false;
+        return;
+    }
+
+    // 4. Parse manifest
+    std::string manifestContent = ReadFileToString(tempManifest);
+    DeleteFileW(tempManifest.c_str());
+
+    if (manifestContent.empty()) {
+        SetDowngradeStatus("");
+        g_isDowngrading = false;
+        return;
+    }
+
+    try {
+        json manifest = json::parse(manifestContent);
+        std::string targetVersion = manifest.value("target_game_version", "");
+        
+        // Get platform key
+        std::string platformKey;
+        switch (platform) {
+            case GamePlatform::STEAM:     platformKey = "steam"; break;
+            case GamePlatform::EPIC:      platformKey = "epic"; break;
+            case GamePlatform::ROCKSTAR:  platformKey = "rockstar"; break;
+            default:                      platformKey = "rockstar"; break;
+        }
+
+        if (!manifest.contains("platforms") || !manifest["platforms"].contains(platformKey)) {
+            SetDowngradeStatus("No downgrade data for " + std::string(PlatformToString(platform)));
+            Sleep(3000);
+            SetDowngradeStatus("");
+            g_isDowngrading = false;
+            return;
+        }
+
+        auto platformData = manifest["platforms"][platformKey];
+        auto files = platformData["files"];
+
+        bool needsDowngrade = false;
+        bool alreadyDowngraded = true;
+        std::vector<DowngradeFileInfo> filesToDowngrade;
+
+        // 5. Check each file's hash
+        SetDowngradeStatus("Verifying game files...");
+        for (auto& fileEntry : files) {
+            DowngradeFileInfo info;
+            info.relativePath = fileEntry.value("path", "");
+            info.sha256Current = fileEntry.value("sha256_current", "");
+            info.sha256Downgraded = fileEntry.value("sha256_downgraded", "");
+            info.downloadUrl = fileEntry.value("download_url", "");
+            info.sizeBytes = fileEntry.value("size_bytes", (uint64_t)0);
+
+            std::wstring fullPath = gtaPath + L"\\" + Utf8ToWide(info.relativePath);
+            std::string fileHash = ComputeSHA256(fullPath);
+
+            if (fileHash == info.sha256Current) {
+                // File is updated (Rockstar's new version) — needs downgrade
+                needsDowngrade = true;
+                alreadyDowngraded = false;
+                filesToDowngrade.push_back(info);
+            } else if (fileHash == info.sha256Downgraded) {
+                // Already downgraded — good
+            } else if (fileHash.empty()) {
+                // File not found — skip
+            } else {
+                // Unknown hash — might be a different version, try downgrade anyway
+                needsDowngrade = true;
+                alreadyDowngraded = false;
+                filesToDowngrade.push_back(info);
+            }
+        }
+
+        if (alreadyDowngraded || !needsDowngrade) {
+            // Already downgraded — just verify protections
+            SetDowngradeStatus("Game already downgraded, verifying protections...");
+            auto status = ApplyUpdateProtection(platform, gtaPath);
+            status.filesDowngraded = true;
+            {
+                std::lock_guard<std::mutex> lock(g_downgradeMutex);
+                g_protectionStatus = status;
+            }
+            SetDowngradeStatus("");
+            g_isDowngrading = false;
+            return;
+        }
+
+        // 6. Download and replace files
+        int totalFiles = (int)filesToDowngrade.size();
+        int currentFile = 0;
+
+        for (auto& info : filesToDowngrade) {
+            currentFile++;
+            std::string progressMsg = "Downgrading (" + std::to_string(currentFile) + "/" + 
+                                      std::to_string(totalFiles) + "): " + info.relativePath;
+            SetDowngradeStatus(progressMsg);
+            g_downgradeProgress = (float)currentFile / (float)totalFiles;
+
+            std::wstring fullPath = gtaPath + L"\\" + Utf8ToWide(info.relativePath);
+            std::wstring backupPath = fullPath + L".original.bak";
+            std::wstring tempPath = fullPath + L".downgrade.tmp";
+
+            // Backup original file (if not already backed up)
+            if (GetFileAttributesW(backupPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                CopyFileW(fullPath.c_str(), backupPath.c_str(), TRUE);
+            }
+
+            // Download downgraded file
+            if (!DownloadFileTo(Utf8ToWide(info.downloadUrl), tempPath)) {
+                SetDowngradeStatus("Download failed: " + info.relativePath);
+                Sleep(3000);
+                DeleteFileW(tempPath.c_str());
+                continue;
+            }
+
+            // Verify downloaded file hash
+            std::string dlHash = ComputeSHA256(tempPath);
+            if (!info.sha256Downgraded.empty() && dlHash != info.sha256Downgraded) {
+                SetDowngradeStatus("Hash mismatch: " + info.relativePath);
+                Sleep(2000);
+                DeleteFileW(tempPath.c_str());
+                continue;
+            }
+
+            // Replace: delete current, rename temp to target
+            DeleteFileW(fullPath.c_str());
+            MoveFileW(tempPath.c_str(), fullPath.c_str());
+        }
+
+        // 7. Apply protections
+        SetDowngradeStatus("Applying update protections...");
+        auto status = ApplyUpdateProtection(platform, gtaPath);
+        status.filesDowngraded = true;
+        {
+            std::lock_guard<std::mutex> lock(g_downgradeMutex);
+            g_protectionStatus = status;
+        }
+
+        // 8. Save downgrade state
+        json state;
+        state["downgraded"] = true;
+        state["target_version"] = targetVersion;
+        state["platform"] = platformKey;
+        state["timestamp"] = std::to_string(GetTickCount64());
+        WriteStringToFile(GetLauncherDir() + L"\\downgrade_state.json", state.dump(2));
+
+        SetDowngradeStatus("Downgrade complete!");
+        Sleep(2000);
+        SetDowngradeStatus("");
+
+    } catch (const std::exception& e) {
+        SetDowngradeStatus(std::string("Manifest error: ") + e.what());
+        Sleep(3000);
+        SetDowngradeStatus("");
+    }
+
+    g_isDowngrading = false;
+    g_downgradeProgress = 0.0f;
+}
+
 static void CheckForUpdatesThread()
 {
     g_isDownloading = true;
@@ -170,15 +788,15 @@ static void CheckForUpdatesThread()
 
         std::wstring cmd = L"powershell -NoProfile -NonInteractive -Command \"";
         cmd += L"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; ";
-        cmd += L"Invoke-WebRequest -UseBasicParsing -Uri '";
+        cmd += L"try { Invoke-WebRequest -UseBasicParsing -Uri '";
         cmd += zipUrl;
         cmd += L"' -OutFile '";
         cmd += zipDest;
-        cmd += L"'; if ($?) { Expand-Archive -Path '";
+        cmd += L"'; Expand-Archive -Path '";
         cmd += zipDest;
         cmd += L"' -DestinationPath '";
         cmd += rage;
-        cmd += L"' -Force } else { exit 1 }\"";
+        cmd += L"' -Force; exit 0 } catch { exit 1 }\"";
 
         STARTUPINFOW si{}; si.cb = sizeof(si);
         si.dwFlags = STARTF_USESHOWWINDOW;
@@ -213,6 +831,207 @@ static void CheckForUpdatesThread()
     g_isDownloading = false;
 }
 
+static bool KillProcessByName(const wchar_t* processName) {
+    // Use taskkill for reliable process termination
+    std::wstring cmd = L"taskkill /F /IM ";
+    cmd += processName;
+    cmd += L" /T"; // kill child processes too
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+
+    std::wstring cmdCopy = cmd;
+    if (CreateProcessW(nullptr, cmdCopy.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 5000);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return exitCode == 0;
+    }
+    return false;
+}
+
+static bool IsProcessRunning(const wchar_t* processName) {
+    std::wstring cmd = L"tasklist /FI \"IMAGENAME eq ";
+    cmd += processName;
+    cmd += L"\" /NH";
+
+    // Create pipes to read output
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hReadPipe, hWritePipe;
+    CreatePipe(&hReadPipe, &hWritePipe, &sa, 0);
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    PROCESS_INFORMATION pi{};
+
+    std::wstring cmdCopy = cmd;
+    bool running = false;
+    if (CreateProcessW(nullptr, cmdCopy.data(), nullptr, nullptr, TRUE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(hWritePipe);
+        char buf[4096] = {0};
+        DWORD bytesRead;
+        ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, nullptr);
+        WaitForSingleObject(pi.hProcess, 3000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        // If the process name appears in output, it's running
+        std::string output(buf);
+        std::string needle = WideToUtf8(std::wstring(processName));
+        // Case-insensitive search
+        std::transform(output.begin(), output.end(), output.begin(), ::tolower);
+        std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+        running = (output.find(needle) != std::string::npos);
+    } else {
+        CloseHandle(hWritePipe);
+    }
+    CloseHandle(hReadPipe);
+    return running;
+}
+
+// Add firewall rules to block platform launchers from phoning home
+static void BlockPlatformNetworkAccess(GamePlatform platform) {
+    // Block Rockstar Social Club / Launcher from communicating
+    // These are critical: they trigger version checks and auto-updates
+    const wchar_t* processesToBlock[] = {
+        L"SocialClubHelper.exe",
+        L"RockstarService.exe", 
+        L"LauncherPatcher.exe",
+        L"Launcher.exe",        // Rockstar Games Launcher
+    };
+
+    for (auto proc : processesToBlock) {
+        std::wstring ruleName = std::wstring(L"SharaxStealth_") + proc;
+        if (IsFirewallRuleExists(ruleName)) continue;
+
+        // Find full path of the process (if running)
+        // We block by process name which is sufficient
+        std::wstring cmd = L"netsh advfirewall firewall add rule "
+            L"name=\"" + ruleName + L"\" "
+            L"dir=out "
+            L"action=block "
+            L"program=\"%ProgramFiles%\\Rockstar Games\\Launcher\\" + std::wstring(proc) + L"\" "
+            L"enable=yes "
+            L"profile=any";
+        RunElevatedCommand(cmd);
+    }
+
+    // Platform-specific blocks
+    if (platform == GamePlatform::STEAM) {
+        // Block Steam from checking game file integrity 
+        std::wstring ruleName = L"SharaxStealth_SteamService";
+        if (!IsFirewallRuleExists(ruleName)) {
+            std::wstring cmd = L"netsh advfirewall firewall add rule "
+                L"name=\"" + ruleName + L"\" "
+                L"dir=out "
+                L"action=block "
+                L"program=\"%ProgramFiles(x86)%\\Steam\\bin\\cef\\cef.win7x64\\steamwebhelper.exe\" "
+                L"enable=yes "
+                L"profile=any";
+            RunElevatedCommand(cmd);
+        }
+    }
+
+    if (platform == GamePlatform::EPIC) {
+        // Block Epic's background services 
+        std::wstring ruleName = L"SharaxStealth_EpicService";
+        if (!IsFirewallRuleExists(ruleName)) {
+            std::wstring cmd = L"netsh advfirewall firewall add rule "
+                L"name=\"" + ruleName + L"\" "
+                L"dir=out "
+                L"action=block "
+                L"program=\"%ProgramFiles(x86)%\\Epic Games\\Launcher\\Engine\\Binaries\\Win64\\EpicGamesLauncher.exe\" "
+                L"enable=yes "
+                L"profile=any";
+            RunElevatedCommand(cmd);
+        }
+    }
+}
+
+static void StealthKillPlatformProcesses(GamePlatform platform) {
+    // Always kill Rockstar components — they exist on ALL platforms
+    KillProcessByName(L"GTAVLauncher.exe");
+    KillProcessByName(L"SocialClubHelper.exe");
+    KillProcessByName(L"RockstarService.exe");
+    KillProcessByName(L"LauncherPatcher.exe");
+    KillProcessByName(L"PlayGTAV.exe");
+    
+    // Platform-specific cleanup
+    switch (platform) {
+        case GamePlatform::STEAM:
+            // Don't kill Steam entirely — just stop its game monitoring
+            // Steam uses SteamService.exe for updates
+            KillProcessByName(L"SteamService.exe");
+            break;
+        case GamePlatform::EPIC:
+            // Kill Epic's background processes that monitor game state
+            KillProcessByName(L"EpicGamesLauncher.exe");
+            KillProcessByName(L"EpicWebHelper.exe");
+            break;
+        case GamePlatform::ROCKSTAR:
+            // Kill the Rockstar Games Launcher
+            KillProcessByName(L"Launcher.exe");
+            break;
+        default:
+            break;
+    }
+
+    Sleep(500);
+}
+
+static void CleanupStealthFirewallRules() {
+    const wchar_t* ruleNames[] = {
+        L"SharaxStealth_SocialClubHelper.exe",
+        L"SharaxStealth_RockstarService.exe",
+        L"SharaxStealth_LauncherPatcher.exe",
+        L"SharaxStealth_Launcher.exe",
+        L"SharaxStealth_SteamService",
+        L"SharaxStealth_EpicService",
+    };
+    for (auto rule : ruleNames) {
+        std::wstring cmd = L"netsh advfirewall firewall delete rule name=\"";
+        cmd += rule;
+        cmd += L"\"";
+        RunElevatedCommand(cmd);
+    }
+}
+
+static void PrepareStealth(GamePlatform platform) {
+    // NOTE: We do NOT use firewall blocking — it breaks RAGEMP's 
+    // Social Club authentication. Instead we use passive protections only.
+
+    // 1. Set Social Club offline mode via registry
+    SetSCOfflineMode();
+
+    // 2. Platform-specific manifest protection (read-only lock)
+    //    This prevents the platform from modifying game files
+    switch (platform) {
+        case GamePlatform::STEAM:
+            ProtectSteamManifest();
+            break;
+        case GamePlatform::EPIC: {
+            std::wstring gtaPath = FindGTAPath();
+            if (!gtaPath.empty())
+                ProtectEpicInstallation(gtaPath);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 static bool SpawnUpdater(const std::wstring& ragempDir)
 {
     std::wstring exe = ragempDir + L"\\updater.exe";
@@ -241,6 +1060,7 @@ static bool SpawnUpdater(const std::wstring& ragempDir)
     return ok != FALSE;
 }
 
+
 static void OnConnect()
 {
     if (g_app.server[0] == 0) {
@@ -261,6 +1081,19 @@ static void OnConnect()
         return;
     }
 
+    // === STEALTH MODE: Kill platform launchers before game launch ===
+    SetStatus("Preparing stealth launch...", false);
+    
+    std::wstring gtaPath = FindGTAPath();
+    GamePlatform platform = GamePlatform::UNKNOWN;
+    if (!gtaPath.empty()) {
+        platform = DetectGamePlatform(gtaPath);
+    }
+    
+    // Activate stealth: block network + kill processes + protect manifests
+    PrepareStealth(platform);
+
+    // === Launch RAGEMP ===
     std::wstring base = GetLauncherDir();
     std::wstring rage = base + L"\\RAGEMP";
 
@@ -269,7 +1102,7 @@ static void OnConnect()
         return;
     }
 
-    SetStatus("Launching game...", false);
+    SetStatus("Launching game (stealth)...", false);
 }
 
 static void SetStatus(const std::string& msg, bool isError)
@@ -474,6 +1307,89 @@ static void DrawUI()
         if (g_fontSmall) ImGui::PopFont();
     }
 
+    // ==================== DOWNGRADE PROTECTION STATUS PANEL ====================
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    
+    // Separator line
+    ImDrawList* panelDL = ImGui::GetWindowDrawList();
+    float sepY = ImGui::GetCursorScreenPos().y;
+    panelDL->AddLine(ImVec2(kSidePad, sepY), ImVec2(WINDOW_W - kSidePad, sepY), 
+                     IM_COL32(40, 40, 45, 255), 1.0f);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+    // Panel title
+    if (g_fontTitle) ImGui::PushFont(g_fontTitle);
+    ImGui::SetCursorPosX(kSidePad);
+    ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.80f, 1.0f), "%s", 
+        Tr("Downgrade Protection", "Downgrade Koruma", "\xd0\x97\xd0\xb0\xd1\x89\xd0\xb8\xd1\x82\xd0\xb0 \xd0\xb4\xd0\xb0\xd1\x83\xd0\xbd\xd0\xb3\xd1\x80\xd0\xb5\xd0\xb9\xd0\xb4\xd0\xb0"));
+    if (g_fontTitle) ImGui::PopFont();
+
+    if (g_fontSmall) ImGui::PushFont(g_fontSmall);
+
+    // Downgrade status message (if active)
+    std::string dgMsg;
+    {
+        std::lock_guard<std::mutex> lock(g_downgradeMutex);
+        dgMsg = g_downgradeStatusMsg;
+    }
+    if (!dgMsg.empty()) {
+        ImGui::SetCursorPosX(kSidePad);
+        ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f), "%s", dgMsg.c_str());
+        
+        // Progress bar during downgrade
+        if (g_downgradeProgress > 0.0f && g_downgradeProgress < 1.0f) {
+            ImGui::SetCursorPosX(kSidePad);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 0.82f, 0.70f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.08f, 0.08f, 0.09f, 1.0f));
+            ImGui::ProgressBar(g_downgradeProgress, ImVec2(kFieldW, 4.0f), "");
+            ImGui::PopStyleColor(2);
+        }
+    }
+
+    // Protection status indicators
+    ProtectionStatus ps;
+    {
+        std::lock_guard<std::mutex> lock(g_downgradeMutex);
+        ps = g_protectionStatus;
+    }
+
+    auto StatusLine = [&](const char* label, bool ok) {
+        ImGui::SetCursorPosX(kSidePad + 8.0f);
+        if (ok)
+            ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.45f, 1.0f), "[OK]");
+        else
+            ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.60f, 1.0f), "[--]");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.70f, 1.0f), "%s", label);
+    };
+
+    // Platform info
+    if (ps.platform != GamePlatform::UNKNOWN) {
+        ImGui::SetCursorPosX(kSidePad + 8.0f);
+        ImGui::TextColored(ImVec4(0.50f, 0.70f, 0.90f, 1.0f), "%s: %s", 
+            Tr("Platform", "Platform", "\xd0\x9f\xd0\xbb\xd0\xb0\xd1\x82\xd1\x84\xd0\xbe\xd1\x80\xd0\xbc\xd0\xb0"), 
+            ps.platformName.c_str());
+    }
+
+    // File status
+    StatusLine(Tr("Game files", "Oyun dosyalari", "\xd0\xa4\xd0\xb0\xd0\xb9\xd0\xbb\xd1\x8b \xd0\xb8\xd0\xb3\xd1\x80\xd1\x8b"), ps.filesDowngraded);
+    
+    // Social Club firewall
+    StatusLine(Tr("Social Club firewall", "Social Club guvenlik duvari", "\xd0\x91\xd1\x80\xd0\xb0\xd0\xbd\xd0\xb4\xd0\xbc\xd0\xb0\xd1\x83\xd1\x8d\xd1\x80 Social Club"), ps.socialClubBlocked);
+    
+    // SC Offline mode
+    StatusLine(Tr("Offline mode", "Cevrimdisi mod", "\xd0\x9e\xd1\x84\xd1\x84\xd0\xbb\xd0\xb0\xd0\xb9\xd0\xbd \xd1\x80\xd0\xb5\xd0\xb6\xd0\xb8\xd0\xbc"), ps.scOfflineMode);
+
+    // Platform-specific
+    if (ps.platform == GamePlatform::STEAM) {
+        StatusLine(Tr("Steam manifest locked", "Steam manifest kilitli", "\xd0\x9c\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x84\xd0\xb5\xd1\x81\xd1\x82 Steam \xd0\xb7\xd0\xb0\xd0\xb1\xd0\xbb\xd0\xbe\xd0\xba\xd0\xb8\xd1\x80\xd0\xbe\xd0\xb2\xd0\xb0\xd0\xbd"), ps.steamManifestLocked);
+    } else if (ps.platform == GamePlatform::EPIC) {
+        StatusLine(Tr("Epic manifest locked", "Epic manifest kilitli", "\xd0\x9c\xd0\xb0\xd0\xbd\xd0\xb8\xd1\x84\xd0\xb5\xd1\x81\xd1\x82 Epic \xd0\xb7\xd0\xb0\xd0\xb1\xd0\xbb\xd0\xbe\xd0\xba\xd0\xb8\xd1\x80\xd0\xbe\xd0\xb2\xd0\xb0\xd0\xbd"), ps.epicManifestLocked);
+    }
+
+    if (g_fontSmall) ImGui::PopFont();
+    // ==================== END PROTECTION PANEL ====================
+
     if (g_fontSmall) ImGui::PushFont(g_fontSmall);
     const char* foot = "winner was here";
     ImVec2 fsz = ImGui::CalcTextSize(foot);
@@ -487,7 +1403,7 @@ static void DrawUI()
                                WINDOW_H - fsz.y - fsz2.y - 18.0f));
     ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.40f, 1.0f), "%s", footerText);
 
-    const char* ver = "v1.0.0";
+    const char* ver = "v2.0.0";
     ImVec2 vsz = ImGui::CalcTextSize(ver);
     ImGui::SetCursorPos(ImVec2(WINDOW_W - vsz.x - 8.0f, WINDOW_H - vsz.y - 8.0f));
     ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.40f, 1.0f), "%s", ver);
@@ -659,6 +1575,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     UpdateWindow(g_hwnd);
 
     std::thread(CheckForUpdatesThread).detach();
+    std::thread(DowngradeCheckThread).detach();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -702,6 +1619,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(1, 0);
     }
+
+    // Cleanup stealth firewall rules on exit
+    CleanupStealthFirewallRules();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
