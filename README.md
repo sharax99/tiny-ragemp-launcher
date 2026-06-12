@@ -327,4 +327,53 @@ Sunucu listesi özelleştirmesi yalnızca görüntülenen listeyi değiştirir. 
 | ✅     | Özel ikon desteği                              |
 | ✅     | Özelleştirilebilir güncelleme altyapısı        |
 
+📄 GitHub Release / README (Detailed)
+🛡️ Auto Downgrade System
+When Rockstar Games releases a new GTA V update, it may break compatibility with RAGEMP. This update enables the launcher to automatically roll back your game files to the last known working version.
 
+How It Works:
+
+On startup, the launcher automatically locates your GTA V installation
+Detects which platform you're using (Steam / Epic Games / Rockstar)
+Downloads a remote manifest (JSON) that specifies which files should have which hashes
+If your files have been updated (new Rockstar version):
+Backs up your original files with .original.bak extension
+Downloads the old (working) version files from the CDN
+Verifies SHA-256 hashes of downloaded files
+Replaces the game files
+Automatically applies platform-specific update protections
+Files Monitored:
+
+GTA5.exe — Main game engine
+PlayGTAV.exe — Epic Games launcher executable
+update\update.rpf — Game data archive
+update\update2.rpf — Secondary update archive
+🔒 Platform Update Protection
+After a downgrade, protection mechanisms are applied to prevent platforms from re-updating the game files:
+
+Platform	Protection Method
+Steam	appmanifest_271590.acf set to read-only, StateFlags=4 and AutoUpdateBehavior=1
+Epic Games	GTA V manifest file (.item) locked as read-only
+Rockstar	Social Club set to offline mode via -scOfflineOnly registry flag
+These protections do not affect RAGEMP's normal operation — they only prevent platforms from triggering game updates.
+
+🐛 Bug Fixes
+RAGEMP update loop fixed: version.txt was not being written due to a PowerShell error handling issue, causing update.zip to re-download on every launch. Fixed by replacing $? operator with proper try/catch block.
+PowerShell compatibility: Download and extraction commands wrapped in reliable error handling.
+⚙️ Technical Details
+Dependencies: nlohmann/json, bcrypt.lib (SHA-256)
+Build: CMake + Visual Studio 2022, Release x64
+Requirements: Windows 10+, Administrator privileges
+Supported Platforms: Steam, Epic Games Store, Rockstar Games Launcher
+📦 Installation
+Download tiny-ragemp-launcher.exe
+Place it in any folder
+Run it (administrator permission will be requested)
+Enter the server address and click PLAY
+Note: The downgrade system requires the server owner to publish a downgrade_manifest.json file. Server owners can reference downgrade_manifest_example.json as a template.
+
+🔖 Version Info
+Version: v2.0
+Date: June 12, 2026
+Compatible GTA V: v1.0.3788.0 (Build 3788 — Title Update 1.72)
+Build: Release x64
